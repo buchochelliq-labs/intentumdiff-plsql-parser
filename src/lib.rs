@@ -70,10 +70,38 @@ enum Lex {
     Str,
     /// Inside a `"..."` quoted identifier (kept verbatim; `""` escapes `"`).
     QuotedIdent,
+    /// Inside an alternative-quoted `q'<open>...<close>'` literal (kept
+    /// verbatim); holds the closing delimiter byte.
+    QStr(u8),
+}
+
+/// Length of an alternative-quoting prefix `q'<open>` / `nq'<open>` (any case)
+/// starting at `i`, with its closing delimiter, if one starts there.
+fn q_quote_start(bytes: &[u8], i: usize) -> Option<(usize, u8)> {
+    let word_char = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$' | b'#');
+    if i > 0 && word_char(bytes[i - 1]) {
+        return None;
+    }
+    let n = usize::from(matches!(bytes.get(i), Some(b'n' | b'N')));
+    if !matches!(bytes.get(i + n), Some(b'q' | b'Q')) || bytes.get(i + n + 1) != Some(&b'\'') {
+        return None;
+    }
+    let open = *bytes.get(i + n + 2)?;
+    if !open.is_ascii_graphic() || open == b'\'' {
+        return None;
+    }
+    let close = match open {
+        b'[' => b']',
+        b'{' => b'}',
+        b'(' => b')',
+        b'<' => b'>',
+        other => other,
+    };
+    Some((n + 3, close))
 }
 
 /// Removes ordinary `--` and `/* */` comments from one row, honouring string
-/// literals (`''` escapes), quoted identifiers (`""` escapes) and optimizer
+/// literals (`''` escapes, `q'[...]'` alternative quoting), quoted identifiers (`""` escapes) and optimizer
 /// hints (`/*+`, `--+`), which are kept.
 fn strip_comments(text: &str, state: &mut Lex) -> String {
     let bytes = text.as_bytes();
@@ -112,6 +140,20 @@ fn strip_comments(text: &str, state: &mut Lex) -> String {
                     }
                 } else {
                     i += 1;
+                }
+            }
+            Lex::QStr(close) => {
+                if bytes[i] == close && bytes.get(i + 1) == Some(&b'\'') {
+                    *state = Lex::Code;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            Lex::Code if q_quote_start(bytes, i).is_some() => {
+                if let Some((len, close)) = q_quote_start(bytes, i) {
+                    *state = Lex::QStr(close);
+                    i += len;
                 }
             }
             Lex::Code => match bytes[i] {
@@ -642,6 +684,43 @@ mod tests {
         );
         assert!(labels.contains(&"x := 2;".to_string()), "{labels:?}");
         assert_spans_valid(src);
+    }
+
+    // Regression: intentumdiff-plsql-parser#8.
+    #[test]
+    fn alternative_quoted_strings_keep_embedded_apostrophes_and_markers() {
+        let old = "BEGIN\n  v := q'[it's -- old]';\nEND;\n";
+        let new = "BEGIN\n  v := q'[it's -- new]';\nEND;\n";
+        assert!(body_labels(old).contains(&"v := q'[it's -- old]';".to_string()));
+        assert!(body_labels(new).contains(&"v := q'[it's -- new]';".to_string()));
+        assert_ne!(projection(&tree(old)), projection(&tree(new)));
+        for (src, label) in [
+            (
+                "BEGIN\n  v := Q'{a'b}' || 'c'; -- note\nEND;\n",
+                "v := Q'{a'b}' || 'c';",
+            ),
+            (
+                "BEGIN\n  v := nq'(x' /* y)'; /* z */\nEND;\n",
+                "v := nq'(x' /* y)';",
+            ),
+            ("BEGIN\n  v := NQ'<x'>' ;\nEND;\n", "v := NQ'<x'>' ;"),
+            ("BEGIN\n  v := q'!it's!'; -- c\nEND;\n", "v := q'!it's!';"),
+            // Ordinary strings and identifiers ending in q are unaffected.
+            ("BEGIN\n  v := 'it''s'; -- c\nEND;\n", "v := 'it''s';"),
+            ("BEGIN\n  seq'x' := 1; -- c\nEND;\n", "seq'x' := 1;"),
+        ] {
+            let labels = body_labels(src);
+            assert!(labels.contains(&label.to_string()), "{src:?}: {labels:?}");
+            assert_spans_valid(src);
+        }
+        // A q-quoted literal may span rows; comment markers inside stay.
+        let multi = "BEGIN\n  v := q'[a'\n-- not a comment\n]';\n  w := 1; -- c\nEND;\n";
+        let labels = body_labels(multi);
+        assert!(
+            labels.contains(&"-- not a comment".to_string()),
+            "{labels:?}"
+        );
+        assert!(labels.contains(&"w := 1;".to_string()), "{labels:?}");
     }
 
     #[test]
