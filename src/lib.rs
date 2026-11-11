@@ -68,10 +68,13 @@ enum Lex {
     Hint,
     /// Inside a `'...'` string literal (kept verbatim).
     Str,
+    /// Inside a `"..."` quoted identifier (kept verbatim; `""` escapes `"`).
+    QuotedIdent,
 }
 
 /// Removes ordinary `--` and `/* */` comments from one row, honouring string
-/// literals (`''` escapes) and optimizer hints (`/*+`, `--+`), which are kept.
+/// literals (`''` escapes), quoted identifiers (`""` escapes) and optimizer
+/// hints (`/*+`, `--+`), which are kept.
 fn strip_comments(text: &str, state: &mut Lex) -> String {
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
@@ -98,9 +101,10 @@ fn strip_comments(text: &str, state: &mut Lex) -> String {
                     i += 1;
                 }
             }
-            Lex::Str => {
-                if bytes[i] == b'\'' {
-                    if bytes.get(i + 1) == Some(&b'\'') {
+            Lex::Str | Lex::QuotedIdent => {
+                let quote = if *state == Lex::Str { b'\'' } else { b'"' };
+                if bytes[i] == quote {
+                    if bytes.get(i + 1) == Some(&quote) {
                         i += 2;
                     } else {
                         *state = Lex::Code;
@@ -113,6 +117,10 @@ fn strip_comments(text: &str, state: &mut Lex) -> String {
             Lex::Code => match bytes[i] {
                 b'\'' => {
                     *state = Lex::Str;
+                    i += 1;
+                }
+                b'"' => {
+                    *state = Lex::QuotedIdent;
                     i += 1;
                 }
                 b'-' if bytes.get(i + 1) == Some(&b'-') => {
@@ -605,6 +613,35 @@ mod tests {
             .collect();
         assert!(labels.contains(&"v := '-- not /* a comment';"));
         assert!(labels.contains(&"SELECT /*+ INDEX(t) */ x INTO y FROM t;"));
+    }
+
+    fn body_labels(source: &str) -> Vec<String> {
+        tree(source)["children"][0]["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["label"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    // Regression: intentumdiff-plsql-parser#7.
+    #[test]
+    fn comment_markers_inside_quoted_identifiers_are_preserved() {
+        let old = "BEGIN\n  \"counter--value\" := 1;\nEND;\n";
+        let new = "BEGIN\n  \"counter--value\" := 2;\nEND;\n";
+        assert!(body_labels(old).contains(&"\"counter--value\" := 1;".to_string()));
+        assert!(body_labels(new).contains(&"\"counter--value\" := 2;".to_string()));
+        assert_ne!(projection(&tree(old)), projection(&tree(new)));
+        // `""` escapes a quote; `/*` inside the identifier is not a comment,
+        // and a real comment after the identifier is still stripped.
+        let src = "BEGIN\n  \"a\"\"/*b\" := 1; -- note\n  x := 2;\nEND;\n";
+        let labels = body_labels(src);
+        assert!(
+            labels.contains(&"\"a\"\"/*b\" := 1;".to_string()),
+            "{labels:?}"
+        );
+        assert!(labels.contains(&"x := 2;".to_string()), "{labels:?}");
+        assert_spans_valid(src);
     }
 
     #[test]
